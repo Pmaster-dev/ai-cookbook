@@ -1,5 +1,6 @@
 import uuid
 import logging
+import asyncio
 from typing import Iterable, List
 import aioboto3
 from botocore.exceptions import ClientError
@@ -78,17 +79,18 @@ class ClaimCheckCodec(PayloadCodec):
         """
         await self._ensure_bucket_exists()
         
-        out: List[Payload] = []
-        for payload in payloads:
-            # Leave small payloads inline to improve debuggability and avoid unnecessary indirection
-            data_size = len(payload.data or b"")
-            if data_size <= self.max_inline_bytes:
-                out.append(payload)
-                continue
+        payload_list = list(payloads)
+        if not payload_list:
+            return []
 
-            encoded = await self.encode_payload(payload)
-            out.append(encoded)
-        return out
+        # Process payload encoding concurrently to avoid sequential S3 latency (reduces runtime from O(N * S3_latency) to O(S3_latency))
+        async def _process_payload(p: Payload) -> Payload:
+            data_size = len(p.data or b"")
+            if data_size <= self.max_inline_bytes:
+                return p
+            return await self.encode_payload(p)
+
+        return list(await asyncio.gather(*[_process_payload(p) for p in payload_list]))
 
     async def decode(self, payloads: Iterable[Payload]) -> List[Payload]:
         """Retrieve original payloads from S3 using stored keys.
@@ -104,21 +106,24 @@ class ClaimCheckCodec(PayloadCodec):
         """
         await self._ensure_bucket_exists()
         
-        out: List[Payload] = []
-        for payload in payloads:
-            if payload.metadata.get("temporal.io/claim-check-codec", b"").decode() != "v1":
-                # Not a claim-checked payload, pass through unchanged
-                out.append(payload)
-                continue
+        payload_list = list(payloads)
+        if not payload_list:
+            return []
 
-            s3_key = payload.data.decode("utf-8")
+        # Retrieve payloads concurrently from S3 to eliminate sequential network round-trips
+        async def _process_payload(p: Payload) -> Payload:
+            if p.metadata.get("temporal.io/claim-check-codec", b"").decode() != "v1":
+                # Not a claim-checked payload, pass through unchanged
+                return p
+
+            s3_key = p.data.decode("utf-8")
             stored_data = await self.get_payload_from_s3(s3_key)
             if stored_data is None:
                 raise ValueError(f"Claim check key not found in S3: {s3_key}")
             
-            original_payload = Payload.FromString(stored_data)
-            out.append(original_payload)
-        return out
+            return Payload.FromString(stored_data)
+
+        return list(await asyncio.gather(*[_process_payload(p) for p in payload_list]))
 
     async def encode_payload(self, payload: Payload) -> Payload:
         """Store payload in S3 and return a key-based payload.
@@ -129,7 +134,8 @@ class ClaimCheckCodec(PayloadCodec):
         Returns:
             Payload containing only the S3 key
         """
-        await self._ensure_bucket_exists()
+        if not self._bucket_created:
+            await self._ensure_bucket_exists()
         
         key = str(uuid.uuid4())
         serialized_data = payload.SerializeToString()
