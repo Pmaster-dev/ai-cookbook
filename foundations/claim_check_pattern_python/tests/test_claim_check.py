@@ -66,6 +66,29 @@ class TestEncodeLargePayloads:
         assert result[0].metadata.get("temporal.io/claim-check-codec") == b"v1"
         s3.put_object.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_multiple_payloads_encoded_concurrently(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        payloads = [
+            _make_payload(b"small"),  # inline
+            _make_payload(b"large data payload 1" * 10),  # claim checked
+            _make_payload(b"tiny"),  # inline
+            _make_payload(b"large data payload 2" * 10),  # claim checked
+        ]
+        results = await codec.encode(payloads)
+
+        assert len(results) == 4
+        assert results[0].data == b"small"
+        assert results[0].metadata.get("temporal.io/claim-check-codec") is None
+        assert results[1].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert results[2].data == b"tiny"
+        assert results[2].metadata.get("temporal.io/claim-check-codec") is None
+        assert results[3].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert s3.put_object.call_count == 2
+
 
 class TestDecodeNonClaimChecked:
     @pytest.mark.asyncio
@@ -105,6 +128,46 @@ class TestDecodeClaimChecked:
 
         assert len(result) == 1
         assert result[0].data == b"original large data"
+
+    @pytest.mark.asyncio
+    async def test_multiple_payloads_decoded_concurrently(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        p1_orig = _make_payload(b"payload 1 content")
+        p2_orig = _make_payload(b"payload 2 content")
+
+        mapping = {
+            "key-1": p1_orig.SerializeToString(),
+            "key-2": p2_orig.SerializeToString(),
+        }
+
+        async def mock_get_object(Bucket, Key):
+            body_mock = AsyncMock()
+            body_mock.read = AsyncMock(return_value=mapping[Key])
+            return {"Body": body_mock}
+
+        s3.get_object.side_effect = mock_get_object
+
+        payloads = [
+            _make_payload(b"inline item"),
+            _make_payload(
+                b"key-1",
+                metadata={"temporal.io/claim-check-codec": b"v1"},
+            ),
+            _make_payload(
+                b"key-2",
+                metadata={"temporal.io/claim-check-codec": b"v1"},
+            ),
+        ]
+
+        results = await codec.decode(payloads)
+
+        assert len(results) == 3
+        assert results[0].data == b"inline item"
+        assert results[1].data == b"payload 1 content"
+        assert results[2].data == b"payload 2 content"
 
 
 class TestDecodeMissingKey:
