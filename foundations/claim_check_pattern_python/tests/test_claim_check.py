@@ -66,6 +66,24 @@ class TestEncodeLargePayloads:
         assert result[0].metadata.get("temporal.io/claim-check-codec") == b"v1"
         s3.put_object.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_multiple_payloads_encoded_concurrently(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        p1 = _make_payload(b"small")
+        p2 = _make_payload(b"large data payload 1" * 5)
+        p3 = _make_payload(b"large data payload 2" * 5)
+
+        results = await codec.encode([p1, p2, p3])
+
+        assert len(results) == 3
+        assert results[0].data == b"small"
+        assert results[1].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert results[2].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert s3.put_object.call_count == 2
+
 
 class TestDecodeNonClaimChecked:
     @pytest.mark.asyncio
@@ -105,6 +123,49 @@ class TestDecodeClaimChecked:
 
         assert len(result) == 1
         assert result[0].data == b"original large data"
+
+    @pytest.mark.asyncio
+    async def test_multiple_claim_checked_payloads_decoded_concurrently(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3 = AsyncMock()
+        s3.head_bucket = AsyncMock()
+
+        orig1 = _make_payload(b"payload 1 data")
+        orig2 = _make_payload(b"payload 2 data")
+
+        async def get_object_side_effect(Bucket, Key):
+            body = AsyncMock()
+            if Key == "key1":
+                body.read.return_value = orig1.SerializeToString()
+            elif Key == "key2":
+                body.read.return_value = orig2.SerializeToString()
+            return {"Body": body}
+
+        s3.get_object.side_effect = get_object_side_effect
+        codec.session = _mock_session(s3)
+
+        p_plain = _make_payload(b"plain payload")
+        p_claim1 = _make_payload(
+            b"key1",
+            metadata={
+                "encoding": b"claim-checked",
+                "temporal.io/claim-check-codec": b"v1",
+            },
+        )
+        p_claim2 = _make_payload(
+            b"key2",
+            metadata={
+                "encoding": b"claim-checked",
+                "temporal.io/claim-check-codec": b"v1",
+            },
+        )
+
+        results = await codec.decode([p_plain, p_claim1, p_claim2])
+
+        assert len(results) == 3
+        assert results[0].data == b"plain payload"
+        assert results[1].data == b"payload 1 data"
+        assert results[2].data == b"payload 2 data"
 
 
 class TestDecodeMissingKey:
