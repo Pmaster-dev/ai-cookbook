@@ -128,3 +128,64 @@ class TestDecodeMissingKey:
 
         with pytest.raises(ValueError, match="Claim check key not found"):
             await codec.decode([claim_check_payload])
+
+
+class TestBatchParallelEncodeAndDecode:
+    @pytest.mark.asyncio
+    async def test_batch_encoding_and_decoding_order_preserved(self):
+        """Verify multiple mixed payloads encode and decode in exact original order concurrently."""
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+
+        # S3 client mock that handles multiple get_object calls
+        s3 = AsyncMock()
+        s3.head_bucket = AsyncMock()
+        s3.put_object = AsyncMock()
+
+        # Map s3 key -> serialized payload bytes
+        stored_s3_objects = {}
+
+        async def mock_put_object(Bucket, Key, Body):
+            stored_s3_objects[Key] = Body
+            return {}
+
+        s3.put_object.side_effect = mock_put_object
+
+        async def mock_get_object(Bucket, Key):
+            if Key not in stored_s3_objects:
+                body = AsyncMock()
+                body.read = AsyncMock(return_value=None)
+                return {"Body": body}
+            body = AsyncMock()
+            body.read = AsyncMock(return_value=stored_s3_objects[Key])
+            return {"Body": body}
+
+        s3.get_object.side_effect = mock_get_object
+        codec.session = _mock_session(s3)
+
+        payloads = [
+            _make_payload(b"small_1"),            # inline
+            _make_payload(b"large_payload_1"),    # S3
+            _make_payload(b"small_2"),            # inline
+            _make_payload(b"large_payload_2"),    # S3
+            _make_payload(b"small_3"),            # inline
+        ]
+
+        encoded_payloads = await codec.encode(payloads)
+        assert len(encoded_payloads) == 5
+
+        # Check inline vs claim-checked
+        assert encoded_payloads[0].data == b"small_1"
+        assert encoded_payloads[1].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert encoded_payloads[2].data == b"small_2"
+        assert encoded_payloads[3].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert encoded_payloads[4].data == b"small_3"
+
+        decoded_payloads = await codec.decode(encoded_payloads)
+        assert len(decoded_payloads) == 5
+
+        # Verify exact order and original data restoration
+        assert decoded_payloads[0].data == b"small_1"
+        assert decoded_payloads[1].data == b"large_payload_1"
+        assert decoded_payloads[2].data == b"small_2"
+        assert decoded_payloads[3].data == b"large_payload_2"
+        assert decoded_payloads[4].data == b"small_3"
