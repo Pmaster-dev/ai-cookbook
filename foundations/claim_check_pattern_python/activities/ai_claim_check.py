@@ -52,8 +52,13 @@ async def rag_answer(req: RagRequest, ingest_result: IngestResult) -> RagAnswer:
     tokenized_query = req.question.split()
     scores = bm25.get_scores(tokenized_query)
 
-    # Get top-k indices by score
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[: max(1, req.top_k)]
+    import heapq
+
+    # Get top-k indices by score using a heap-based selection algorithm.
+    # heapq.nlargest runs in O(N log k) time compared to full sorting in O(N log N),
+    # significantly reducing compute time when searching across thousands of document chunks.
+    top_k = max(1, req.top_k)
+    top_indices = heapq.nlargest(top_k, range(len(scores)), key=lambda i: scores[i])
     contexts = [ingest_result.chunk_texts[i] for i in top_indices]
     sources = [{"chunk_index": i, "score": float(scores[i])} for i in top_indices]
 
