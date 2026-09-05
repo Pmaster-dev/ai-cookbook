@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 import logging
 from typing import Iterable, List
@@ -68,7 +69,7 @@ class ClaimCheckCodec(PayloadCodec):
         self._bucket_created = True
 
     async def encode(self, payloads: Iterable[Payload]) -> List[Payload]:
-        """Replace large payloads with keys and store original data in S3.
+        """Replace large payloads with keys and store original data in S3 concurrently.
         
         Args:
             payloads: Iterable of payloads to encode
@@ -78,20 +79,28 @@ class ClaimCheckCodec(PayloadCodec):
         """
         await self._ensure_bucket_exists()
         
-        out: List[Payload] = []
-        for payload in payloads:
-            # Leave small payloads inline to improve debuggability and avoid unnecessary indirection
-            data_size = len(payload.data or b"")
-            if data_size <= self.max_inline_bytes:
-                out.append(payload)
-                continue
+        payload_list = list(payloads)
+        if not payload_list:
+            return []
 
-            encoded = await self.encode_payload(payload)
-            out.append(encoded)
-        return out
+        # Optimization: Reuse a single S3 client session and process payload encoding
+        # concurrently using asyncio.gather to avoid O(N) sequential S3 connection setups.
+        async with self.session.client(
+            's3',
+            endpoint_url=self.endpoint_url,
+            region_name=self.region_name
+        ) as s3_client:
+            async def _encode_one(p: Payload) -> Payload:
+                # Leave small payloads inline to improve debuggability and avoid unnecessary indirection
+                data_size = len(p.data or b"")
+                if data_size <= self.max_inline_bytes:
+                    return p
+                return await self.encode_payload(p, s3_client=s3_client)
+
+            return list(await asyncio.gather(*[_encode_one(p) for p in payload_list]))
 
     async def decode(self, payloads: Iterable[Payload]) -> List[Payload]:
-        """Retrieve original payloads from S3 using stored keys.
+        """Retrieve original payloads from S3 using stored keys concurrently.
         
         Args:
             payloads: Iterable of payloads to decode
@@ -104,27 +113,37 @@ class ClaimCheckCodec(PayloadCodec):
         """
         await self._ensure_bucket_exists()
         
-        out: List[Payload] = []
-        for payload in payloads:
-            if payload.metadata.get("temporal.io/claim-check-codec", b"").decode() != "v1":
-                # Not a claim-checked payload, pass through unchanged
-                out.append(payload)
-                continue
+        payload_list = list(payloads)
+        if not payload_list:
+            return []
 
-            s3_key = payload.data.decode("utf-8")
-            stored_data = await self.get_payload_from_s3(s3_key)
-            if stored_data is None:
-                raise ValueError(f"Claim check key not found in S3: {s3_key}")
-            
-            original_payload = Payload.FromString(stored_data)
-            out.append(original_payload)
-        return out
+        # Optimization: Reuse a single S3 client session and process payload decoding
+        # concurrently using asyncio.gather to avoid O(N) sequential S3 connection setups.
+        async with self.session.client(
+            's3',
+            endpoint_url=self.endpoint_url,
+            region_name=self.region_name
+        ) as s3_client:
+            async def _decode_one(p: Payload) -> Payload:
+                if p.metadata.get("temporal.io/claim-check-codec", b"").decode() != "v1":
+                    # Not a claim-checked payload, pass through unchanged
+                    return p
 
-    async def encode_payload(self, payload: Payload) -> Payload:
+                s3_key = p.data.decode("utf-8")
+                stored_data = await self.get_payload_from_s3(s3_key, s3_client=s3_client)
+                if stored_data is None:
+                    raise ValueError(f"Claim check key not found in S3: {s3_key}")
+
+                return Payload.FromString(stored_data)
+
+            return list(await asyncio.gather(*[_decode_one(p) for p in payload_list]))
+
+    async def encode_payload(self, payload: Payload, s3_client=None) -> Payload:
         """Store payload in S3 and return a key-based payload.
         
         Args:
             payload: Original payload to store
+            s3_client: Optional existing S3 client to avoid re-opening connections
             
         Returns:
             Payload containing only the S3 key
@@ -135,16 +154,23 @@ class ClaimCheckCodec(PayloadCodec):
         serialized_data = payload.SerializeToString()
         
         # Store the original payload data in S3
-        async with self.session.client(
-            's3',
-            endpoint_url=self.endpoint_url,
-            region_name=self.region_name
-        ) as s3_client:
+        if s3_client is not None:
             await s3_client.put_object(
                 Bucket=self.bucket_name,
                 Key=key,
                 Body=serialized_data
             )
+        else:
+            async with self.session.client(
+                's3',
+                endpoint_url=self.endpoint_url,
+                region_name=self.region_name
+            ) as client:
+                await client.put_object(
+                    Bucket=self.bucket_name,
+                    Key=key,
+                    Body=serialized_data
+                )
         
         # Return a lightweight payload containing only the key
         return Payload(
@@ -155,26 +181,34 @@ class ClaimCheckCodec(PayloadCodec):
             data=key.encode("utf-8"),
         )
 
-    async def get_payload_from_s3(self, s3_key: str) -> bytes:
+    async def get_payload_from_s3(self, s3_key: str, s3_client=None) -> bytes:
         """Retrieve payload data from S3.
         
         Args:
             s3_key: S3 object key
+            s3_client: Optional existing S3 client to avoid re-opening connections
             
         Returns:
             Raw payload data bytes, or None if not found
         """
         try:
-            async with self.session.client(
-                's3',
-                endpoint_url=self.endpoint_url,
-                region_name=self.region_name
-            ) as s3_client:
+            if s3_client is not None:
                 response = await s3_client.get_object(
                     Bucket=self.bucket_name,
                     Key=s3_key
                 )
                 return await response['Body'].read()
+            else:
+                async with self.session.client(
+                    's3',
+                    endpoint_url=self.endpoint_url,
+                    region_name=self.region_name
+                ) as client:
+                    response = await client.get_object(
+                        Bucket=self.bucket_name,
+                        Key=s3_key
+                    )
+                    return await response['Body'].read()
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
                 return None
