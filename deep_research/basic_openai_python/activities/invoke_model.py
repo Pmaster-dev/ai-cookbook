@@ -6,22 +6,29 @@ from pydantic import BaseModel
 from pydantic.functional_validators import BeforeValidator
 from pydantic.functional_serializers import PlainSerializer
 
+import functools
 import importlib
 
 T = TypeVar("T", bound=BaseModel)
 
 
+@functools.lru_cache(maxsize=128)
+def _load_class_by_path(path: str) -> type[Any]:
+    """Helper to load a class from its string path with LRU caching."""
+    mod_path, sep, qual = path.partition(":")
+    if not sep:  # support "package.module.Class"
+        mod_path, _, qual = path.rpartition(".")
+    module = importlib.import_module(mod_path)
+    obj = module
+    for attr in qual.split("."):
+        obj = getattr(obj, attr)
+    return cast(type[Any], obj)
+
+
 def _coerce_class(v: Any) -> type[Any]:
     """Pydantic validator: convert string path to class during deserialization."""
     if isinstance(v, str):
-        mod_path, sep, qual = v.partition(":")
-        if not sep:  # support "package.module.Class"
-            mod_path, _, qual = v.rpartition(".")
-        module = importlib.import_module(mod_path)
-        obj = module
-        for attr in qual.split("."):
-            obj = getattr(obj, attr)
-        return cast(type[Any], obj)
+        return _load_class_by_path(v)
     elif isinstance(v, type):
         return v
     else:
