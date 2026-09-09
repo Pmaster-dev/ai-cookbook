@@ -66,6 +66,25 @@ class TestEncodeLargePayloads:
         assert result[0].metadata.get("temporal.io/claim-check-codec") == b"v1"
         s3.put_object.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_batch_payloads_encoded_concurrently(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        payloads = [
+            _make_payload(b"small"),  # inline
+            _make_payload(b"large data 1 " * 5),  # claim-checked
+            _make_payload(b"large data 2 " * 5),  # claim-checked
+        ]
+        results = await codec.encode(payloads)
+
+        assert len(results) == 3
+        assert results[0].data == b"small"
+        assert results[1].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert results[2].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert s3.put_object.call_count == 2
+
 
 class TestDecodeNonClaimChecked:
     @pytest.mark.asyncio
@@ -105,6 +124,39 @@ class TestDecodeClaimChecked:
 
         assert len(result) == 1
         assert result[0].data == b"original large data"
+
+    @pytest.mark.asyncio
+    async def test_batch_payloads_decoded_concurrently(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        # Mock get_payload_from_s3 to return stored payloads based on key
+        async def mock_get_payload(key: str):
+            p = _make_payload(f"data-for-{key}".encode("utf-8"))
+            return p.SerializeToString()
+
+        codec.get_payload_from_s3 = AsyncMock(side_effect=mock_get_payload)
+
+        payloads = [
+            _make_payload(b"unencoded-1"),
+            _make_payload(
+                b"key-1",
+                metadata={"temporal.io/claim-check-codec": b"v1"},
+            ),
+            _make_payload(
+                b"key-2",
+                metadata={"temporal.io/claim-check-codec": b"v1"},
+            ),
+        ]
+
+        results = await codec.decode(payloads)
+
+        assert len(results) == 3
+        assert results[0].data == b"unencoded-1"
+        assert results[1].data == b"data-for-key-1"
+        assert results[2].data == b"data-for-key-2"
+        assert codec.get_payload_from_s3.call_count == 2
 
 
 class TestDecodeMissingKey:
