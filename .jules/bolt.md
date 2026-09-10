@@ -1,0 +1,3 @@
+## 2025-05-18 - Concurrent Temporal PayloadCodec Processing
+**Learning:** Temporal `PayloadCodec` implementations receive `Iterable[Payload]` batches for workflow/activity arguments and return values. Sequentially awaiting remote storage operations (like S3 uploads/downloads in claim check codecs) creates an O(N) sequential I/O bottleneck. Using `asyncio.gather` processes all payloads concurrently, reducing latency to O(1) network roundtrips while preserving exact payload ordering.
+**Action:** When implementing or optimizing Temporal `PayloadCodec` methods (`encode`/`decode`), always wrap per-payload async operations with `asyncio.gather`.
