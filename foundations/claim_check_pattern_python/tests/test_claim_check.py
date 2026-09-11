@@ -66,6 +66,24 @@ class TestEncodeLargePayloads:
         assert result[0].metadata.get("temporal.io/claim-check-codec") == b"v1"
         s3.put_object.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_multiple_payloads_batch_encode(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        p1 = _make_payload(b"small")
+        p2 = _make_payload(b"x" * 100)
+        p3 = _make_payload(b"y" * 100)
+
+        results = await codec.encode([p1, p2, p3])
+
+        assert len(results) == 3
+        assert results[0].data == b"small"
+        assert results[1].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert results[2].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert s3.put_object.call_count == 2
+
 
 class TestDecodeNonClaimChecked:
     @pytest.mark.asyncio
@@ -105,6 +123,35 @@ class TestDecodeClaimChecked:
 
         assert len(result) == 1
         assert result[0].data == b"original large data"
+
+    @pytest.mark.asyncio
+    async def test_multiple_payloads_batch_decode(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, body = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        p1_orig = _make_payload(b"data 1")
+        p2_orig = _make_payload(b"data 2")
+
+        async def mock_get_payload(key: str):
+            if key == "key-1":
+                return p1_orig.SerializeToString()
+            if key == "key-2":
+                return p2_orig.SerializeToString()
+            return None
+
+        codec.get_payload_from_s3 = AsyncMock(side_effect=mock_get_payload)
+
+        plain_payload = _make_payload(b"inline", metadata={"encoding": b"json/plain"})
+        cc1 = _make_payload(b"key-1", metadata={"temporal.io/claim-check-codec": b"v1"})
+        cc2 = _make_payload(b"key-2", metadata={"temporal.io/claim-check-codec": b"v1"})
+
+        results = await codec.decode([plain_payload, cc1, cc2])
+
+        assert len(results) == 3
+        assert results[0].data == b"inline"
+        assert results[1].data == b"data 1"
+        assert results[2].data == b"data 2"
 
 
 class TestDecodeMissingKey:
