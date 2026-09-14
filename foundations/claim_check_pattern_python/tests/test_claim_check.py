@@ -128,3 +128,74 @@ class TestDecodeMissingKey:
 
         with pytest.raises(ValueError, match="Claim check key not found"):
             await codec.decode([claim_check_payload])
+
+
+class TestBatchEncodeAndDecode:
+    @pytest.mark.asyncio
+    async def test_batch_encode_mixed_payloads(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        payloads = [
+            _make_payload(b"small"),
+            _make_payload(b"large data exceeding threshold"),
+            _make_payload(b"tiny"),
+            _make_payload(b"another large payload data"),
+        ]
+
+        encoded = await codec.encode(payloads)
+        assert len(encoded) == 4
+        assert encoded[0].data == b"small"
+        assert encoded[1].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert encoded[2].data == b"tiny"
+        assert encoded[3].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert s3.put_object.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_decode_multiple_payloads(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, body = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        p1 = _make_payload(b"payload 1 content")
+        p2 = _make_payload(b"payload 2 content")
+
+        async def mock_get_payload(key):
+            if key == "key-1":
+                return p1.SerializeToString()
+            if key == "key-2":
+                return p2.SerializeToString()
+            return None
+
+        codec.get_payload_from_s3 = AsyncMock(side_effect=mock_get_payload)
+
+        claim_checked_1 = _make_payload(
+            b"key-1",
+            metadata={
+                "encoding": b"claim-checked",
+                "temporal.io/claim-check-codec": b"v1",
+            },
+        )
+        small_inline = _make_payload(b"small inline")
+        claim_checked_2 = _make_payload(
+            b"key-2",
+            metadata={
+                "encoding": b"claim-checked",
+                "temporal.io/claim-check-codec": b"v1",
+            },
+        )
+
+        decoded = await codec.decode([claim_checked_1, small_inline, claim_checked_2])
+        assert len(decoded) == 3
+        assert decoded[0].data == b"payload 1 content"
+        assert decoded[1].data == b"small inline"
+        assert decoded[2].data == b"payload 2 content"
+
+    @pytest.mark.asyncio
+    async def test_empty_payload_list(self):
+        codec = ClaimCheckCodec()
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+        assert await codec.encode([]) == []
+        assert await codec.decode([]) == []
