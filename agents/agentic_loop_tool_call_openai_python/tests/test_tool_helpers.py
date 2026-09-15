@@ -2,7 +2,11 @@
 
 from pydantic import BaseModel, Field
 
-from helpers.tool_helpers import oai_responses_tool_from_model, HELPFUL_AGENT_SYSTEM_INSTRUCTIONS
+from helpers.tool_helpers import (
+    oai_responses_tool_from_model,
+    _cached_strict_json_schema,
+    HELPFUL_AGENT_SYSTEM_INSTRUCTIONS,
+)
 
 
 class _SampleModel(BaseModel):
@@ -21,6 +25,15 @@ class TestOaiResponsesToolFromModel:
         assert params["type"] == "object"
         assert "name" in params["properties"]
         assert "count" in params["properties"]
+
+    def test_caching_and_mutation_safety(self):
+        _cached_strict_json_schema.cache_clear()
+        res1 = oai_responses_tool_from_model("my_tool", "Does something", _SampleModel)
+        res2 = oai_responses_tool_from_model("my_tool", "Does something", _SampleModel)
+        assert res1["parameters"] == res2["parameters"]
+        assert res1["parameters"] is not res2["parameters"]  # distinct copies to prevent mutation bugs
+        info = _cached_strict_json_schema.cache_info()
+        assert info.hits >= 1
 
     def test_with_none_model(self):
         result = oai_responses_tool_from_model("no_params", "No params", None)
