@@ -1,0 +1,3 @@
+## 2025-05-18 - Concurrent Payload Codec Encoding and Decoding
+**Learning:** Temporal payload codecs process collections of payloads for workflow arguments and return values. Performing network I/O sequentially inside `encode()` or `decode()` loops turns batch processing latency into $O(N \times T)$. Using `asyncio.gather` executes network I/O (such as S3 operations) concurrently while maintaining exact input payload ordering.
+**Action:** When working with batch data operations or Temporal payload codecs, always process async tasks concurrently with `asyncio.gather(*tasks)` rather than awaiting items sequentially in a `for` loop.
