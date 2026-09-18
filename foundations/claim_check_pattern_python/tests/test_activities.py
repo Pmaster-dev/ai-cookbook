@@ -3,8 +3,9 @@
 import pytest
 from temporalio.testing import ActivityEnvironment
 
-from activities.ai_claim_check import _split_text, ingest_document
-from shared.models import IngestRequest
+from unittest.mock import AsyncMock, patch, MagicMock
+from activities.ai_claim_check import _split_text, ingest_document, rag_answer
+from shared.models import IngestRequest, IngestResult, RagRequest
 
 
 class TestSplitText:
@@ -67,3 +68,39 @@ class TestIngestDocument:
         )
         with pytest.raises(ValueError, match="Unsupported MIME type"):
             await env.run(ingest_document, req)
+
+
+class TestRagAnswer:
+    @pytest.mark.asyncio
+    @patch("openai.AsyncOpenAI")
+    async def test_rag_answer_top_k_selection(self, mock_openai_cls):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_chat = AsyncMock()
+        mock_client.chat = mock_chat
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock(message=MagicMock(content="Sample RAG Answer"))]
+        mock_chat.completions.create.return_value = mock_response
+
+        env = ActivityEnvironment()
+        ingest_res = IngestResult(
+            chunk_texts=[
+                "apple orange banana",
+                "quantum physics mechanics relativity",
+                "apple banana fruit smoothy",
+                "gardening soil plants flowers",
+            ],
+            metadata={},
+        )
+        req = RagRequest(
+            question="quantum physics",
+            top_k=2,
+            generation_model="gpt-4o-mini",
+        )
+
+        result = await env.run(rag_answer, req, ingest_res)
+        assert result.answer == "Sample RAG Answer"
+        assert len(result.sources) == 2
+        # Index 1 should be top match for "quantum physics"
+        assert result.sources[0]["chunk_index"] == 1
