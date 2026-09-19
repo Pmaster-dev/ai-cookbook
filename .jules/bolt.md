@@ -1,0 +1,3 @@
+## 2025-05-18 - Concurrent S3 Payload Encoding/Decoding in Temporal Codecs
+**Learning:** Temporal `PayloadCodec` implementations receive batches of payloads in `encode()` and `decode()`. Sequential `await` loops for S3/remote storage calls create an $O(N)$ latency bottleneck. Using `asyncio.gather` processes all S3 put/get operations in parallel, reducing latency to $O(1)$ network roundtrips while preserving exact payload order.
+**Action:** When implementing or optimizing Temporal `PayloadCodec` or batch activity methods, execute asynchronous I/O concurrently with `asyncio.gather` instead of sequentially in a loop.
