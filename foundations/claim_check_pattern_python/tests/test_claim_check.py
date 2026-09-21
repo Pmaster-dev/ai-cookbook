@@ -128,3 +128,45 @@ class TestDecodeMissingKey:
 
         with pytest.raises(ValueError, match="Claim check key not found"):
             await codec.decode([claim_check_payload])
+
+
+class TestBatchConcurrentOperations:
+    @pytest.mark.asyncio
+    async def test_batch_encode_and_decode_mixed_payloads(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, body = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        payload_small1 = _make_payload(b"small1")
+        payload_large1 = _make_payload(b"x" * 100)
+        payload_small2 = _make_payload(b"small2")
+        payload_large2 = _make_payload(b"y" * 200)
+
+        encoded = await codec.encode([payload_small1, payload_large1, payload_small2, payload_large2])
+
+        assert len(encoded) == 4
+        assert encoded[0].data == b"small1"
+        assert encoded[1].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert encoded[2].data == b"small2"
+        assert encoded[3].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert s3.put_object.call_count == 2
+
+        # Mock decode side for the two large payloads
+        orig_large1 = payload_large1
+        orig_large2 = payload_large2
+
+        async def fake_get_payload(key):
+            if key == encoded[1].data.decode("utf-8"):
+                return orig_large1.SerializeToString()
+            elif key == encoded[3].data.decode("utf-8"):
+                return orig_large2.SerializeToString()
+            return None
+
+        codec.get_payload_from_s3 = AsyncMock(side_effect=fake_get_payload)
+
+        decoded = await codec.decode(encoded)
+        assert len(decoded) == 4
+        assert decoded[0].data == b"small1"
+        assert decoded[1].data == b"x" * 100
+        assert decoded[2].data == b"small2"
+        assert decoded[3].data == b"y" * 200
