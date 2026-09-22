@@ -66,6 +66,20 @@ class TestEncodeLargePayloads:
         assert result[0].metadata.get("temporal.io/claim-check-codec") == b"v1"
         s3.put_object.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_multiple_large_payloads_encoded_concurrently(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        payloads = [_make_payload(f"large_data_{i}".encode() * 10) for i in range(5)]
+        result = await codec.encode(payloads)
+
+        assert len(result) == 5
+        for res in result:
+            assert res.metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert s3.put_object.call_count == 5
+
 
 class TestDecodeNonClaimChecked:
     @pytest.mark.asyncio
@@ -105,6 +119,35 @@ class TestDecodeClaimChecked:
 
         assert len(result) == 1
         assert result[0].data == b"original large data"
+
+    @pytest.mark.asyncio
+    async def test_multiple_claim_checked_payloads_decoded_concurrently(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        async def mock_get_payload(s3_key: str):
+            orig = _make_payload(f"data_for_{s3_key}".encode())
+            return orig.SerializeToString()
+
+        codec.get_payload_from_s3 = AsyncMock(side_effect=mock_get_payload)
+
+        claim_check_payloads = [
+            _make_payload(
+                f"key-{i}".encode(),
+                metadata={
+                    "encoding": b"claim-checked",
+                    "temporal.io/claim-check-codec": b"v1",
+                },
+            )
+            for i in range(5)
+        ]
+
+        result = await codec.decode(claim_check_payloads)
+
+        assert len(result) == 5
+        for i, res in enumerate(result):
+            assert res.data == f"data_for_key-{i}".encode()
 
 
 class TestDecodeMissingKey:
