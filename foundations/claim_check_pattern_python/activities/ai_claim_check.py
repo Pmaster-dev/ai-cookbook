@@ -1,3 +1,4 @@
+import heapq
 from typing import List
 
 from temporalio import activity
@@ -52,8 +53,10 @@ async def rag_answer(req: RagRequest, ingest_result: IngestResult) -> RagAnswer:
     tokenized_query = req.question.split()
     scores = bm25.get_scores(tokenized_query)
 
-    # Get top-k indices by score
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[: max(1, req.top_k)]
+    # Get top-k indices by score efficiently using max-heap algorithm (heapq.nlargest)
+    # Reduces complexity from O(N log N) full sort to O(N log k) partial selection
+    k = max(1, req.top_k)
+    top_indices = heapq.nlargest(k, range(len(scores)), key=scores.__getitem__)
     contexts = [ingest_result.chunk_texts[i] for i in top_indices]
     sources = [{"chunk_index": i, "score": float(scores[i])} for i in top_indices]
 
