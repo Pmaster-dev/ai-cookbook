@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 import logging
 from typing import Iterable, List
@@ -69,7 +70,10 @@ class ClaimCheckCodec(PayloadCodec):
 
     async def encode(self, payloads: Iterable[Payload]) -> List[Payload]:
         """Replace large payloads with keys and store original data in S3.
-        
+
+        Performance optimization: Process all payloads in parallel using asyncio.gather
+        to execute S3 uploads concurrently, reducing batch latency from O(N * latency) to O(latency).
+
         Args:
             payloads: Iterable of payloads to encode
             
@@ -77,22 +81,22 @@ class ClaimCheckCodec(PayloadCodec):
             List of encoded payloads (keys for claim-checked payloads)
         """
         await self._ensure_bucket_exists()
-        
-        out: List[Payload] = []
-        for payload in payloads:
+
+        async def _encode_one(payload: Payload) -> Payload:
             # Leave small payloads inline to improve debuggability and avoid unnecessary indirection
             data_size = len(payload.data or b"")
             if data_size <= self.max_inline_bytes:
-                out.append(payload)
-                continue
+                return payload
+            return await self.encode_payload(payload)
 
-            encoded = await self.encode_payload(payload)
-            out.append(encoded)
-        return out
+        return list(await asyncio.gather(*[_encode_one(p) for p in payloads]))
 
     async def decode(self, payloads: Iterable[Payload]) -> List[Payload]:
         """Retrieve original payloads from S3 using stored keys.
-        
+
+        Performance optimization: Process all payloads in parallel using asyncio.gather
+        to execute S3 downloads concurrently, reducing batch latency from O(N * latency) to O(latency).
+
         Args:
             payloads: Iterable of payloads to decode
             
@@ -103,22 +107,20 @@ class ClaimCheckCodec(PayloadCodec):
             ValueError: If a claim check key is not found in S3
         """
         await self._ensure_bucket_exists()
-        
-        out: List[Payload] = []
-        for payload in payloads:
+
+        async def _decode_one(payload: Payload) -> Payload:
             if payload.metadata.get("temporal.io/claim-check-codec", b"").decode() != "v1":
                 # Not a claim-checked payload, pass through unchanged
-                out.append(payload)
-                continue
+                return payload
 
             s3_key = payload.data.decode("utf-8")
             stored_data = await self.get_payload_from_s3(s3_key)
             if stored_data is None:
                 raise ValueError(f"Claim check key not found in S3: {s3_key}")
             
-            original_payload = Payload.FromString(stored_data)
-            out.append(original_payload)
-        return out
+            return Payload.FromString(stored_data)
+
+        return list(await asyncio.gather(*[_decode_one(p) for p in payloads]))
 
     async def encode_payload(self, payload: Payload) -> Payload:
         """Store payload in S3 and return a key-based payload.

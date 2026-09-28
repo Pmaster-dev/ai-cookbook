@@ -128,3 +128,65 @@ class TestDecodeMissingKey:
 
         with pytest.raises(ValueError, match="Claim check key not found"):
             await codec.decode([claim_check_payload])
+
+
+class TestBatchEncodeAndDecode:
+    @pytest.mark.asyncio
+    async def test_batch_encode_multiple_payloads(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, _ = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        payload1 = _make_payload(b"small")
+        payload2 = _make_payload(b"x" * 50)
+        payload3 = _make_payload(b"y" * 100)
+
+        results = await codec.encode([payload1, payload2, payload3])
+
+        assert len(results) == 3
+        assert results[0].data == b"small"
+        assert results[1].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert results[2].metadata.get("temporal.io/claim-check-codec") == b"v1"
+        assert s3.put_object.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_decode_multiple_payloads(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, body = _mock_s3_client()
+        codec.session = _mock_session(s3)
+
+        orig1 = _make_payload(b"large data item 1")
+        orig2 = _make_payload(b"large data item 2")
+
+        async def mock_get_object(Bucket, Key):
+            mock_body = AsyncMock()
+            if Key == "key1":
+                mock_body.read.return_value = orig1.SerializeToString()
+            elif Key == "key2":
+                mock_body.read.return_value = orig2.SerializeToString()
+            return {"Body": mock_body}
+
+        s3.get_object.side_effect = mock_get_object
+
+        p_small = _make_payload(b"small inline payload")
+        p_claim1 = _make_payload(
+            b"key1",
+            metadata={
+                "encoding": b"claim-checked",
+                "temporal.io/claim-check-codec": b"v1",
+            },
+        )
+        p_claim2 = _make_payload(
+            b"key2",
+            metadata={
+                "encoding": b"claim-checked",
+                "temporal.io/claim-check-codec": b"v1",
+            },
+        )
+
+        results = await codec.decode([p_small, p_claim1, p_claim2])
+
+        assert len(results) == 3
+        assert results[0].data == b"small inline payload"
+        assert results[1].data == b"large data item 1"
+        assert results[2].data == b"large data item 2"
