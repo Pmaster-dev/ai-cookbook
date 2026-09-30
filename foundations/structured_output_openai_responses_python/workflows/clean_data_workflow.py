@@ -2,6 +2,9 @@ from pydantic import BaseModel, Field, field_validator, EmailStr
 from pydantic_core import PydanticCustomError
 import re
 from temporalio import workflow
+
+# Pre-compile E.164 regex pattern at module level to avoid regex parsing/compilation overhead on every validator execution.
+E164_PATTERN = re.compile(r"^\+[1-9]\d{9,15}$")
 from activities import invoke_model
 from activities.invoke_model import InvokeModelRequest
 from typing import List, Optional
@@ -56,9 +59,7 @@ class Business(BaseModel):
                 return None
 
             # E.164 format: + followed by 1-9, then 9-15 more digits
-            e164_pattern = r"^\+[1-9]\d{9,15}$"
-
-            if not re.match(e164_pattern, v):
+            if not E164_PATTERN.match(v):
                 raise PydanticCustomError(
                     "phone_format",
                     "Phone number must be in E.164 format (e.g., +12025550173)",
