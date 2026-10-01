@@ -1,5 +1,6 @@
-import uuid
+import asyncio
 import logging
+import uuid
 from typing import Iterable, List
 import aioboto3
 from botocore.exceptions import ClientError
@@ -41,31 +42,94 @@ class ClaimCheckCodec(PayloadCodec):
 
         self._bucket_created = False
 
-    async def _ensure_bucket_exists(self):
+    async def _ensure_bucket_exists(self, s3_client=None):
         """Ensure the S3 bucket exists, creating it if necessary."""
         if self._bucket_created:
             return
-            
-        async with self.session.client(
-            's3',
-            endpoint_url=self.endpoint_url,
-            region_name=self.region_name
-        ) as s3_client:
-            try:
-                await s3_client.head_bucket(Bucket=self.bucket_name)
-            except ClientError as e:
-                error_code = e.response['Error']['Code']
-                if error_code in ['404', 'NoSuchBucket']:
-                    try:
-                        await s3_client.create_bucket(Bucket=self.bucket_name)
-                    except ClientError as create_error:
-                        # Handle bucket already exists race condition
-                        if create_error.response['Error']['Code'] not in ['BucketAlreadyExists', 'BucketAlreadyOwnedByYou']:
-                            raise create_error
-                elif error_code not in ['403', 'Forbidden']:
-                    raise e
+
+        if s3_client is not None:
+            await self._check_or_create_bucket(s3_client)
+        else:
+            async with self.session.client(
+                's3',
+                endpoint_url=self.endpoint_url,
+                region_name=self.region_name
+            ) as client:
+                await self._check_or_create_bucket(client)
+
+    async def _check_or_create_bucket(self, s3_client):
+        """Helper to check/create bucket using an existing S3 client."""
+        if self._bucket_created:
+            return
+        try:
+            await s3_client.head_bucket(Bucket=self.bucket_name)
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code in ['404', 'NoSuchBucket']:
+                try:
+                    await s3_client.create_bucket(Bucket=self.bucket_name)
+                except ClientError as create_error:
+                    # Handle bucket already exists race condition
+                    if create_error.response['Error']['Code'] not in ['BucketAlreadyExists', 'BucketAlreadyOwnedByYou']:
+                        raise create_error
+            elif error_code not in ['403', 'Forbidden']:
+                raise e
         
         self._bucket_created = True
+
+    async def _encode_payload_with_client(self, s3_client, payload: Payload) -> Payload:
+        """Encode a single payload using an existing S3 client session.
+
+        Performance optimization: Avoids opening/closing S3 client sessions per payload
+        and enables concurrent processing.
+        """
+        data_size = len(payload.data or b"")
+        if data_size <= self.max_inline_bytes:
+            return payload
+
+        key = str(uuid.uuid4())
+        serialized_data = payload.SerializeToString()
+
+        await s3_client.put_object(
+            Bucket=self.bucket_name,
+            Key=key,
+            Body=serialized_data
+        )
+
+        return Payload(
+            metadata={
+                "encoding": b"claim-checked",
+                "temporal.io/claim-check-codec": b"v1",
+            },
+            data=key.encode("utf-8"),
+        )
+
+    async def _decode_payload_with_client(self, s3_client, payload: Payload) -> Payload:
+        """Decode a single payload using an existing S3 client session.
+
+        Performance optimization: Avoids opening/closing S3 client sessions per payload
+        and enables concurrent processing.
+        """
+        if payload.metadata.get("temporal.io/claim-check-codec", b"").decode() != "v1":
+            return payload
+
+        s3_key = payload.data.decode("utf-8")
+        try:
+            response = await s3_client.get_object(
+                Bucket=self.bucket_name,
+                Key=s3_key
+            )
+            stored_data = await response['Body'].read()
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                stored_data = None
+            else:
+                raise e
+
+        if stored_data is None:
+            raise ValueError(f"Claim check key not found in S3: {s3_key}")
+
+        return Payload.FromString(stored_data)
 
     async def encode(self, payloads: Iterable[Payload]) -> List[Payload]:
         """Replace large payloads with keys and store original data in S3.
@@ -76,19 +140,19 @@ class ClaimCheckCodec(PayloadCodec):
         Returns:
             List of encoded payloads (keys for claim-checked payloads)
         """
-        await self._ensure_bucket_exists()
-        
-        out: List[Payload] = []
-        for payload in payloads:
-            # Leave small payloads inline to improve debuggability and avoid unnecessary indirection
-            data_size = len(payload.data or b"")
-            if data_size <= self.max_inline_bytes:
-                out.append(payload)
-                continue
+        payload_list = list(payloads)
+        if not payload_list:
+            return []
 
-            encoded = await self.encode_payload(payload)
-            out.append(encoded)
-        return out
+        async with self.session.client(
+            's3',
+            endpoint_url=self.endpoint_url,
+            region_name=self.region_name
+        ) as s3_client:
+            await self._ensure_bucket_exists(s3_client)
+            # Process payloads concurrently using shared S3 client connection pool
+            tasks = [self._encode_payload_with_client(s3_client, p) for p in payload_list]
+            return list(await asyncio.gather(*tasks))
 
     async def decode(self, payloads: Iterable[Payload]) -> List[Payload]:
         """Retrieve original payloads from S3 using stored keys.
@@ -102,23 +166,19 @@ class ClaimCheckCodec(PayloadCodec):
         Raises:
             ValueError: If a claim check key is not found in S3
         """
-        await self._ensure_bucket_exists()
-        
-        out: List[Payload] = []
-        for payload in payloads:
-            if payload.metadata.get("temporal.io/claim-check-codec", b"").decode() != "v1":
-                # Not a claim-checked payload, pass through unchanged
-                out.append(payload)
-                continue
+        payload_list = list(payloads)
+        if not payload_list:
+            return []
 
-            s3_key = payload.data.decode("utf-8")
-            stored_data = await self.get_payload_from_s3(s3_key)
-            if stored_data is None:
-                raise ValueError(f"Claim check key not found in S3: {s3_key}")
-            
-            original_payload = Payload.FromString(stored_data)
-            out.append(original_payload)
-        return out
+        async with self.session.client(
+            's3',
+            endpoint_url=self.endpoint_url,
+            region_name=self.region_name
+        ) as s3_client:
+            await self._ensure_bucket_exists(s3_client)
+            # Retrieve payloads concurrently using shared S3 client connection pool
+            tasks = [self._decode_payload_with_client(s3_client, p) for p in payload_list]
+            return list(await asyncio.gather(*tasks))
 
     async def encode_payload(self, payload: Payload) -> Payload:
         """Store payload in S3 and return a key-based payload.
@@ -129,31 +189,13 @@ class ClaimCheckCodec(PayloadCodec):
         Returns:
             Payload containing only the S3 key
         """
-        await self._ensure_bucket_exists()
-        
-        key = str(uuid.uuid4())
-        serialized_data = payload.SerializeToString()
-        
-        # Store the original payload data in S3
         async with self.session.client(
             's3',
             endpoint_url=self.endpoint_url,
             region_name=self.region_name
         ) as s3_client:
-            await s3_client.put_object(
-                Bucket=self.bucket_name,
-                Key=key,
-                Body=serialized_data
-            )
-        
-        # Return a lightweight payload containing only the key
-        return Payload(
-            metadata={
-                "encoding": b"claim-checked",
-                "temporal.io/claim-check-codec": b"v1",
-            },
-            data=key.encode("utf-8"),
-        )
+            await self._ensure_bucket_exists(s3_client)
+            return await self._encode_payload_with_client(s3_client, payload)
 
     async def get_payload_from_s3(self, s3_key: str) -> bytes:
         """Retrieve payload data from S3.
