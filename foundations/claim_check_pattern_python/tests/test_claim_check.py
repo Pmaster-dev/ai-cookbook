@@ -67,6 +67,40 @@ class TestEncodeLargePayloads:
         s3.put_object.assert_called_once()
 
 
+class TestBatchProcessing:
+    @pytest.mark.asyncio
+    async def test_batch_encode_and_decode_concurrently(self):
+        codec = ClaimCheckCodec(max_inline_bytes=10)
+        s3, body = _mock_s3_client()
+        session = _mock_session(s3)
+        codec.session = session
+
+        # Prepare batch of 5 large payloads
+        payloads = [_make_payload(f"large-data-{i}".encode() * 5) for i in range(5)]
+
+        encoded_results = await codec.encode(payloads)
+        assert len(encoded_results) == 5
+        assert s3.put_object.call_count == 5
+        # Session client context manager should be opened only once for the whole batch
+        assert session.client.call_count == 1
+
+        # Reset mock call count to test decode batching
+        session.client.reset_mock()
+
+        # Prepare decode responses
+        async def mock_get_object(Bucket, Key):
+            p = _make_payload(f"decoded-{Key}".encode())
+            body_mock = AsyncMock()
+            body_mock.read.return_value = p.SerializeToString()
+            return {"Body": body_mock}
+
+        s3.get_object.side_effect = mock_get_object
+
+        decoded_results = await codec.decode(encoded_results)
+        assert len(decoded_results) == 5
+        assert session.client.call_count == 1
+
+
 class TestDecodeNonClaimChecked:
     @pytest.mark.asyncio
     async def test_non_claim_checked_passes_through(self):
@@ -113,10 +147,11 @@ class TestDecodeMissingKey:
         codec = ClaimCheckCodec()
         s3, body = _mock_s3_client()
         codec.session = _mock_session(s3)
-        body.read.return_value = None
 
-        # Patch get_payload_from_s3 to return None (key not found)
-        codec.get_payload_from_s3 = AsyncMock(return_value=None)
+        # Configure get_object to raise ClientError with 'NoSuchKey'
+        from botocore.exceptions import ClientError
+        error_response = {'Error': {'Code': 'NoSuchKey'}}
+        s3.get_object.side_effect = ClientError(error_response, 'GetObject')
 
         claim_check_payload = _make_payload(
             b"missing-key",

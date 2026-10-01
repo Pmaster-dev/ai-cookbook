@@ -1,0 +1,3 @@
+## 2025-05-18 - Batch Payload S3 Session Reuse and Concurrency in Temporal Codecs
+**Learning:** Sequential S3 client creation (`async with session.client('s3')`) per payload in Temporal `PayloadCodec.encode()` / `decode()` creates N+1 connection overhead and blocks batch payload processing. Reusing a single client session context per batch and executing tasks concurrently with `asyncio.gather` reduces latency from O(N) sequential round-trips to O(1) concurrent round-trips.
+**Action:** When implementing Temporal `PayloadCodec` or batch I/O handlers, open client sessions once per batch call and wrap I/O operations in `asyncio.gather`.
